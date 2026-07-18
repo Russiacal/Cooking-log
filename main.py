@@ -87,35 +87,72 @@ def publish_cook(
     (local files in dev, GitHub via API in prod). The blog auto-reloads /
     auto-deploys and the post is live at the returned URL.
 
-    Guidance for writing body content:
-    - Keep it conversational — Julia's voice, first person.
-    - Include an `## Ingredients` H2 section listing everything she used
-      (with her substitutions embedded, e.g. "6-8 anchovies (in place of
-      1 tsp anchovy paste)"). Ingredients let her cook from the log without
-      opening the source recipe.
-    - Modifications, what worked, what didn't — embed in flowing prose or
-      short bullet lists as appropriate. Don't force sections that aren't
-      natural for the cook.
-    - For collapsible detailed directions on single-source cooks, use
-      <details><summary>Directions</summary>...</details> — plain HTML in
-      markdown works.
-    - For mixed-recipe cooks, describe the hybrid approach in prose.
+    BEFORE DRAFTING: call `list_recent_cooks(n=3)` and mirror the voice of
+    those posts. The rules below are backup; matching real posts is primary.
+
+    VOICE RULES — hard, apply to every draft:
+
+    1. NEVER use "you" or "your". Julia writes for herself, not an
+       audience. Every "you" must become "I"/"we" or be removed.
+
+    2. Pronouns match reality. Julia solo = "I". Julia cooked with
+       someone (partner, friend, kid) = "we". If unclear from her
+       message who cooked, ASK before drafting.
+
+    3. No editorializing. The body is a memory aid, not an essay. Cut:
+       - Sensory adjectives Julia didn't write ("delightful",
+         "crunchy", "sharp", "silky", "delicious")
+       - Explanations of why techniques work ("spreads the brine
+         through the whole salad", "what you want against the rich
+         stuff")
+       - Outcome judgments ("worked great", "the star", "chef's
+         kiss", "worth it")
+       If Julia explicitly wrote that something worked/failed, keep
+       her exact language. Never invent commentary.
+
+    4. Full grammatical sentences in prose. No fragments.
+       ❌ "Tonnino oil-packed tuna, the espelette pepper one."
+       ✓ "We used Tonnino oil-packed tuna, the espelette pepper
+          variety."
+
+    5. Facts only: what was used, what was done, what deviated from
+       source, what ran long/short, what to do differently next time.
+
+    CONCRETE BEFORE/AFTER — Julia had to rewrite this herself, so it's
+    canonical:
+
+    ❌ Editorializing (rejected — has "you", explains, judges):
+       "The one move I really kept from them: mince the anchovies
+        straight into the dressing instead of draping fillets on top.
+        Spreads the brine through the whole salad and you never get
+        a whole-anchovy bite."
+
+    ✓ Facts only (approved):
+       "We kept their move of mincing the anchovies straight into
+        the dressing instead of draping fillets on top."
+
+    STRUCTURE:
+    - 1-3 prose paragraphs — what happened, in Julia's voice.
+    - `## Ingredients` — bullets with substitutions embedded inline,
+      e.g. "6-8 anchovies (in place of 1 tsp anchovy paste)". This
+      lets Julia re-cook from the log without opening the source.
+    - `## Next time` (optional) — bullets on what to change. Include
+      when Julia mentions something that ran long/short/didn't work.
 
     Args:
-        title: Recipe title, e.g. "Miso-glazed salmon" or "Super quick Caesar
-            salad dressing" (required).
-        body: Markdown body of the post (required).
-        source_url: URL of the original recipe, if any.
+        title: Recipe title, e.g. "Miso-glazed salmon" (required).
+        body: Markdown body per rules above (required).
+        source_url: URL of the original recipe.
         source_name: Human-friendly source name, e.g. "NYT Cooking",
-            "Bon Appétit", "Once Upon a Chef".
+            "ATK", "Once Upon a Chef".
         made_on: Date cooked, YYYY-MM-DD. Defaults to today (LA time).
-        tags: 3-5 tags for filtering/discovery, e.g. ["pasta", "weeknight",
-            "italian"]. Lowercase, short.
-        photos: Image URLs. First one becomes the card thumbnail. Use the
-            source recipe photo if Julia hasn't shared her own.
-        photo_credit: Attribution for the photo when it's from the source
-            recipe, e.g. "Jennifer Segal / Once Upon a Chef". Omit for
-            Julia's own photos.
+        tags: 3-5 lowercase tags. Reuse existing vocab — check
+            list_recent_cooks first.
+        photos: Image URLs. First is the card thumbnail. If Julia hasn't
+            shared her own, use the source recipe photo.
+        photo_credit: Attribution when photo is from the source, e.g.
+            "Jennifer Segal / Once Upon a Chef". Omit for Julia's own
+            photos.
 
     Returns:
         The URL where the new cook is now live.
