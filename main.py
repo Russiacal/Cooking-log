@@ -4,6 +4,12 @@ Cooking-log MCP server.
 Exposes tools that Claude (via a custom MCP connector) uses to publish new
 cooks to Julia's cooking log. Storage is pluggable — local files for dev,
 GitHub Contents API for prod. See backend.py.
+
+Auth is dual-mode:
+- Static Bearer token (MCP_BEARER_TOKEN) — used by smoke tests and any
+  direct API access.
+- OAuth 2.1 authorization_code + PKCE — required by Claude.ai's custom
+  connector UI. See oauth.py.
 """
 from __future__ import annotations
 
@@ -11,6 +17,7 @@ import os
 import re
 from datetime import datetime
 from typing import Optional
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 import uvicorn
@@ -18,9 +25,12 @@ import yaml
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import JSONResponse
+from starlette.requests import Request
+from starlette.responses import JSONResponse, RedirectResponse
+from starlette.routing import Route
 
 from backend import build_backend
+from oauth import OAuthStore, verify_pkce
 
 load_dotenv()
 
@@ -30,7 +40,12 @@ PORT = int(os.environ.get("PORT", "8765"))
 HOST = os.environ.get("HOST", "0.0.0.0")
 TZ = ZoneInfo(os.environ.get("TZ", "America/Los_Angeles"))
 
+OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID")
+OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET")
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
+
 backend = build_backend()
+oauth_store = OAuthStore()
 
 
 def slugify(text: str) -> str:
@@ -207,24 +222,203 @@ def search_cooks(query: str) -> list[dict]:
     return results
 
 
+# ─────────────────────────────────────────────────────────
+# OAuth 2.1 endpoints (for Claude.ai's custom connector UI)
+# ─────────────────────────────────────────────────────────
+
+# Paths that must be reachable WITHOUT auth for the OAuth handshake to work.
+PUBLIC_PATHS = frozenset(
+    {
+        "/.well-known/oauth-authorization-server",
+        "/.well-known/oauth-protected-resource",
+        "/authorize",
+        "/token",
+    }
+)
+
+
+def _base_url(request: Request) -> str:
+    if PUBLIC_URL:
+        return PUBLIC_URL
+    return str(request.base_url).rstrip("/")
+
+
+async def oauth_authorization_server_metadata(request: Request) -> JSONResponse:
+    base = _base_url(request)
+    return JSONResponse(
+        {
+            "issuer": base,
+            "authorization_endpoint": f"{base}/authorize",
+            "token_endpoint": f"{base}/token",
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code"],
+            "code_challenge_methods_supported": ["S256"],
+            "token_endpoint_auth_methods_supported": ["client_secret_post"],
+            "scopes_supported": ["mcp"],
+        }
+    )
+
+
+async def oauth_protected_resource_metadata(request: Request) -> JSONResponse:
+    base = _base_url(request)
+    return JSONResponse(
+        {
+            "resource": base,
+            "authorization_servers": [base],
+            "scopes_supported": ["mcp"],
+            "bearer_methods_supported": ["header"],
+        }
+    )
+
+
+async def authorize(request: Request) -> JSONResponse | RedirectResponse:
+    """Auto-approve. Single-user tool — Julia IS the user consenting."""
+    if not OAUTH_CLIENT_ID:
+        return JSONResponse(
+            {"error": "server_error", "error_description": "OAuth not configured"},
+            status_code=500,
+        )
+
+    params = request.query_params
+    client_id = params.get("client_id", "")
+    redirect_uri = params.get("redirect_uri", "")
+    state = params.get("state", "")
+    code_challenge = params.get("code_challenge", "")
+    code_challenge_method = params.get("code_challenge_method", "")
+    response_type = params.get("response_type", "")
+
+    if client_id != OAUTH_CLIENT_ID:
+        return JSONResponse({"error": "invalid_client"}, status_code=400)
+    if response_type != "code":
+        return JSONResponse({"error": "unsupported_response_type"}, status_code=400)
+    if code_challenge_method != "S256" or not code_challenge:
+        return JSONResponse(
+            {
+                "error": "invalid_request",
+                "error_description": "code_challenge with S256 required",
+            },
+            status_code=400,
+        )
+    if not redirect_uri:
+        return JSONResponse(
+            {"error": "invalid_request", "error_description": "redirect_uri required"},
+            status_code=400,
+        )
+
+    code = oauth_store.issue_code(
+        client_id=client_id,
+        redirect_uri=redirect_uri,
+        code_challenge=code_challenge,
+        code_challenge_method=code_challenge_method,
+    )
+    qs = {"code": code}
+    if state:
+        qs["state"] = state
+    separator = "&" if "?" in redirect_uri else "?"
+    return RedirectResponse(f"{redirect_uri}{separator}{urlencode(qs)}", status_code=302)
+
+
+async def token(request: Request) -> JSONResponse:
+    if not OAUTH_CLIENT_ID or not OAUTH_CLIENT_SECRET:
+        return JSONResponse(
+            {"error": "server_error", "error_description": "OAuth not configured"},
+            status_code=500,
+        )
+
+    form = await request.form()
+    grant_type = form.get("grant_type", "")
+    if grant_type != "authorization_code":
+        return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+
+    client_id = form.get("client_id", "")
+    client_secret = form.get("client_secret", "")
+    code = form.get("code", "")
+    code_verifier = form.get("code_verifier", "")
+
+    if client_id != OAUTH_CLIENT_ID or client_secret != OAUTH_CLIENT_SECRET:
+        return JSONResponse({"error": "invalid_client"}, status_code=401)
+
+    entry = oauth_store.consume_code(code)
+    if entry is None:
+        return JSONResponse(
+            {"error": "invalid_grant", "error_description": "code invalid or expired"},
+            status_code=400,
+        )
+
+    if not verify_pkce(code_verifier, entry.code_challenge, entry.code_challenge_method):
+        return JSONResponse(
+            {"error": "invalid_grant", "error_description": "PKCE verification failed"},
+            status_code=400,
+        )
+
+    access_token = oauth_store.issue_token(client_id)
+    return JSONResponse(
+        {
+            "access_token": access_token,
+            "token_type": "Bearer",
+            "expires_in": 30 * 24 * 3600,
+            "scope": "mcp",
+        }
+    )
+
+
+# ─────────────────────────────────────────────────────────
+# Auth middleware — accepts EITHER static bearer OR OAuth token
+# ─────────────────────────────────────────────────────────
+
 class BearerAuthMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app, token: str):
+    def __init__(self, app, static_token: str, store: OAuthStore) -> None:
         super().__init__(app)
-        self._expected = f"Bearer {token}"
+        self._static_token = static_token
+        self._store = store
 
     async def dispatch(self, request, call_next):
+        if request.url.path in PUBLIC_PATHS:
+            return await call_next(request)
+
         auth = request.headers.get("authorization", "")
-        if auth != self._expected:
-            return JSONResponse(
-                {"error": "unauthorized", "detail": "missing or invalid Bearer token"},
-                status_code=401,
-            )
-        return await call_next(request)
+        if not auth.startswith("Bearer "):
+            return self._challenge(request)
+
+        token_value = auth[len("Bearer "):].strip()
+        if token_value == self._static_token or self._store.validate_token(token_value):
+            return await call_next(request)
+
+        return self._challenge(request)
+
+    def _challenge(self, request: Request) -> JSONResponse:
+        base = _base_url(request)
+        return JSONResponse(
+            {"error": "unauthorized", "detail": "missing or invalid Bearer token"},
+            status_code=401,
+            headers={
+                "WWW-Authenticate": (
+                    f'Bearer realm="cooking-log", '
+                    f'resource_metadata="{base}/.well-known/oauth-protected-resource"'
+                )
+            },
+        )
 
 
 def build_app():
     app = mcp.streamable_http_app()
-    app.add_middleware(BearerAuthMiddleware, token=BEARER_TOKEN)
+    app.router.routes.extend(
+        [
+            Route(
+                "/.well-known/oauth-authorization-server",
+                oauth_authorization_server_metadata,
+                methods=["GET"],
+            ),
+            Route(
+                "/.well-known/oauth-protected-resource",
+                oauth_protected_resource_metadata,
+                methods=["GET"],
+            ),
+            Route("/authorize", authorize, methods=["GET"]),
+            Route("/token", token, methods=["POST"]),
+        ]
+    )
+    app.add_middleware(BearerAuthMiddleware, static_token=BEARER_TOKEN, store=oauth_store)
     return app
 
 
