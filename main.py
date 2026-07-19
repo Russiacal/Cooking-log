@@ -99,7 +99,8 @@ def publish_cook(
        someone (partner, friend, kid) = "we". If unclear from her
        message who cooked, ASK before drafting.
 
-    3. No editorializing. The body is a memory aid, not an essay. Cut:
+    3. No editorializing. No food-writing register. The body is a
+       memory aid, not an essay. Cut:
        - Sensory adjectives Julia didn't write ("delightful",
          "crunchy", "sharp", "silky", "delicious")
        - Explanations of why techniques work ("spreads the brine
@@ -107,16 +108,25 @@ def publish_cook(
          stuff")
        - Outcome judgments ("worked great", "the star", "chef's
          kiss", "worth it")
-       If Julia explicitly wrote that something worked/failed, keep
-       her exact language. Never invent commentary.
+       - Suggestions or improvements Julia didn't raise
+       Whenever Julia provides phrasing, preserve it exactly — don't
+       paraphrase or smooth it out. Never invent commentary.
 
     4. Full grammatical sentences in prose. No fragments.
        ❌ "Tonnino oil-packed tuna, the espelette pepper one."
        ✓ "We used Tonnino oil-packed tuna, the espelette pepper
           variety."
 
-    5. Facts only: what was used, what was done, what deviated from
-       source, what ran long/short, what to do differently next time.
+    5. Facts only, and only the SALIENT facts:
+       - Note deviations from the source, not compliance. Assume
+         Julia followed the recipe unless she says otherwise — don't
+         write "added chorizo per the recipe", she knows.
+       - Don't note absences (skipped ingredients, omitted steps)
+         unless Julia mentioned them.
+       - Skip trivial substitutions. If the recipe just says
+         "paprika", the specific variety Julia used isn't worth
+         mentioning. Only call out swaps that change the dish.
+       - Include what ran long/short/didn't work.
 
     CONCRETE BEFORE/AFTER — Julia had to rewrite this herself, so it's
     canonical:
@@ -132,12 +142,17 @@ def publish_cook(
         the dressing instead of draping fillets on top."
 
     STRUCTURE:
-    - 1-3 prose paragraphs — what happened, in Julia's voice.
-    - `## Ingredients` — bullets with substitutions embedded inline,
-      e.g. "6-8 anchovies (in place of 1 tsp anchovy paste)". This
-      lets Julia re-cook from the log without opening the source.
-    - `## Next time` (optional) — bullets on what to change. Include
-      when Julia mentions something that ran long/short/didn't work.
+    - Opening sentence(s): why Julia made it or where the idea came
+      from, in her words.
+    - Body: 1-3 prose paragraphs — what she followed, what she
+      swapped and why, any technique notes. Embedded naturally, not
+      bulleted.
+    - `## Ingredients` — bullets listing everything used, with
+      substitutions noted inline, e.g. "6-8 anchovies (in place of
+      1 tsp anchovy paste)". Lets Julia re-cook from the log without
+      opening the source.
+    - `## Next time` — only if Julia explicitly gave next-time notes.
+      Don't infer or promote body observations to this section.
 
     Args:
         title: Recipe title, e.g. "Miso-glazed salmon" (required).
