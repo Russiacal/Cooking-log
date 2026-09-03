@@ -5,3 +5,6 @@ __pycache__/
 .env.local
 .DS_Store
 *.log
+*.db
+*.db-shm
+*.db-wal

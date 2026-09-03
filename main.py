@@ -10,9 +10,18 @@ Auth is dual-mode:
   direct API access.
 - OAuth 2.1 authorization_code + PKCE — required by Claude.ai's custom
   connector UI. See oauth.py.
+
+Photo pipeline (Phase 2):
+- iOS Shortcut POSTs to /photos/pending with SHORTCUT_BEARER_TOKEN (a
+  separate bearer, different from MCP_BEARER_TOKEN so we can rotate one
+  without the other).
+- get_pending_photos() lets Claude peek at the queue.
+- publish_cook() auto-attaches unconsumed photos when the `photos` arg
+  is omitted, then marks them consumed.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 from datetime import datetime
@@ -30,7 +39,8 @@ from starlette.responses import JSONResponse, RedirectResponse
 from starlette.routing import Route
 
 from backend import build_backend
-from oauth import OAuthStore, verify_pkce
+from oauth import DEFAULT_TOKEN_TTL_SECONDS, OAuthStore, verify_pkce
+from store import build_stores
 
 load_dotenv()
 
@@ -44,8 +54,12 @@ OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID")
 OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET")
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
 
+SHORTCUT_BEARER_TOKEN = os.environ.get("SHORTCUT_BEARER_TOKEN")
+CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME")
+
 backend = build_backend()
-oauth_store = OAuthStore()
+_db, token_store, photo_queue = build_stores(token_ttl_seconds=DEFAULT_TOKEN_TTL_SECONDS)
+oauth_store = OAuthStore(token_store)
 
 
 def slugify(text: str) -> str:
@@ -154,6 +168,19 @@ def publish_cook(
     - `## Next time` — only if Julia explicitly gave next-time notes.
       Don't infer or promote body observations to this section.
 
+    PHOTOS:
+    - If `photos` is omitted or None, any pending photos uploaded via
+      Julia's iOS Shortcut are auto-attached and the queue is cleared.
+      This is the default happy path — she snaps photos while cooking,
+      the Shortcut queues them, publish_cook picks them up.
+    - Pass `photos=[]` explicitly to publish with NO photos even if
+      there are pending ones.
+    - Pass a specific list of URLs to override (queue is left alone
+      and NOT cleared).
+    - If no pending photos exist AND `photos` is omitted, use the
+      source recipe's photo (with `photo_credit`) so the card has a
+      thumbnail.
+
     Args:
         title: Recipe title, e.g. "Miso-glazed salmon" (required).
         body: Markdown body per rules above (required).
@@ -163,8 +190,9 @@ def publish_cook(
         made_on: Date cooked, YYYY-MM-DD. Defaults to today (LA time).
         tags: 3-5 lowercase tags. Reuse existing vocab — check
             list_recent_cooks first.
-        photos: Image URLs. First is the card thumbnail. If Julia hasn't
-            shared her own, use the source recipe photo.
+        photos: Image URLs. First is the card thumbnail. Omit to
+            auto-attach queued photos; pass [] for no photos; pass a
+            list to override.
         photo_credit: Attribution when photo is from the source, e.g.
             "Jennifer Segal / Once Upon a Chef". Omit for Julia's own
             photos.
@@ -175,6 +203,11 @@ def publish_cook(
     made_on_date = made_on or datetime.now(TZ).date().isoformat()
     slug = f"{made_on_date}-{slugify(title)}"
 
+    if photos is None:
+        resolved_photos = photo_queue.consume_all()
+    else:
+        resolved_photos = photos
+
     fm: dict = {
         "title": title,
         "made_on": made_on_date,
@@ -184,7 +217,7 @@ def publish_cook(
     if source_name:
         fm["source_name"] = source_name
     fm["tags"] = tags or []
-    fm["photos"] = photos or []
+    fm["photos"] = resolved_photos
     if photo_credit:
         fm["photo_credit"] = photo_credit
 
@@ -274,17 +307,35 @@ def search_cooks(query: str) -> list[dict]:
     return results
 
 
+@mcp.tool()
+def get_pending_photos() -> dict:
+    """Peek at photos uploaded via the iOS Shortcut but not yet attached to a cook.
+
+    Useful when Julia says "publish tonight's salmon with the photos I just
+    took" — this confirms what's queued. Note: this does NOT consume the
+    queue. publish_cook consumes it when the `photos` argument is omitted.
+
+    Returns:
+        {count: int, urls: list[str]} — URLs in upload order (oldest first).
+    """
+    urls = photo_queue.list_unconsumed()
+    return {"count": len(urls), "urls": urls}
+
+
 # ─────────────────────────────────────────────────────────
 # OAuth 2.1 endpoints (for Claude.ai's custom connector UI)
 # ─────────────────────────────────────────────────────────
 
-# Paths that must be reachable WITHOUT auth for the OAuth handshake to work.
+# Paths that must be reachable WITHOUT the MCP auth middleware.
+# OAuth endpoints are truly public; /photos/pending has its own bearer
+# check inside the handler using SHORTCUT_BEARER_TOKEN.
 PUBLIC_PATHS = frozenset(
     {
         "/.well-known/oauth-authorization-server",
         "/.well-known/oauth-protected-resource",
         "/authorize",
         "/token",
+        "/photos/pending",
     }
 )
 
@@ -408,9 +459,65 @@ async def token(request: Request) -> JSONResponse:
         {
             "access_token": access_token,
             "token_type": "Bearer",
-            "expires_in": 30 * 24 * 3600,
+            "expires_in": DEFAULT_TOKEN_TTL_SECONDS,
             "scope": "mcp",
         }
+    )
+
+
+# ─────────────────────────────────────────────────────────
+# Photos endpoint (for iOS Shortcut)
+# ─────────────────────────────────────────────────────────
+
+async def photos_pending(request: Request) -> JSONResponse:
+    """POST {urls: [str], uploaded_at?: float} → queue photos for next publish.
+
+    Auth: SHORTCUT_BEARER_TOKEN (separate from MCP_BEARER_TOKEN so the
+    Shortcut's embedded token can be rotated independently of Claude's).
+
+    If CLOUDINARY_CLOUD_NAME is set, URLs must start with
+    https://res.cloudinary.com/<cloud>/ — cheap safety check against
+    someone stumbling on the endpoint and injecting arbitrary URLs.
+    """
+    if not SHORTCUT_BEARER_TOKEN:
+        return JSONResponse(
+            {"error": "server_error", "detail": "SHORTCUT_BEARER_TOKEN not configured"},
+            status_code=500,
+        )
+
+    auth = request.headers.get("authorization", "")
+    if auth != f"Bearer {SHORTCUT_BEARER_TOKEN}":
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    try:
+        payload = await request.json()
+    except (ValueError, json.JSONDecodeError):
+        return JSONResponse({"error": "invalid_json"}, status_code=400)
+
+    urls = payload.get("urls")
+    if not isinstance(urls, list) or not all(isinstance(u, str) for u in urls):
+        return JSONResponse(
+            {"error": "invalid_request", "detail": "urls must be a list of strings"},
+            status_code=400,
+        )
+
+    if CLOUDINARY_CLOUD_NAME:
+        prefix = f"https://res.cloudinary.com/{CLOUDINARY_CLOUD_NAME}/"
+        bad = [u for u in urls if not u.startswith(prefix)]
+        if bad:
+            return JSONResponse(
+                {
+                    "error": "invalid_request",
+                    "detail": f"URLs must start with {prefix}",
+                    "rejected": bad,
+                },
+                status_code=400,
+            )
+
+    uploaded_at = payload.get("uploaded_at")
+    added = photo_queue.add(urls, uploaded_at=uploaded_at)
+    return JSONResponse(
+        {"added": added, "total_pending": photo_queue.count_unconsumed()}
     )
 
 
@@ -468,6 +575,7 @@ def build_app():
             ),
             Route("/authorize", authorize, methods=["GET"]),
             Route("/token", token, methods=["POST"]),
+            Route("/photos/pending", photos_pending, methods=["POST"]),
         ]
     )
     app.add_middleware(BearerAuthMiddleware, static_token=BEARER_TOKEN, store=oauth_store)

@@ -3,17 +3,16 @@ Minimal OAuth 2.1 authorization_code + PKCE server for the cooking-log MCP.
 
 Why this exists: Claude.ai's custom MCP connector UI requires OAuth (not
 raw Bearer tokens). This is the smallest possible OAuth server that
-satisfies the flow — codes and tokens live in memory, single pre-shared
-client_id/secret pair, auto-approves the /authorize step (no consent
-screen — this is Julia's tool, she IS the consenter).
+satisfies the flow — single pre-shared client_id/secret pair, auto-approves
+the /authorize step (no consent screen — this is Julia's tool, she IS
+the consenter).
 
-Trade-offs:
-- In-memory store: Railway container restarts kick users back through
-  /authorize. Fine for a personal tool; upgrade to SQLite if annoying.
-- Auto-approve: any request to /authorize with the right client_id gets
-  a code. Safe because /token still requires client_secret + PKCE.
-- Access tokens don't expire in-memory (they'd expire naturally on
-  restart anyway).
+Split of state:
+- Authorization codes stay in-memory. 5-minute TTL, single-use; if a
+  Railway restart drops them mid-handshake, Claude just retries.
+- Access tokens live in SQLite (via store.OAuthTokenStore) so restarts
+  don't force Julia to re-auth. Default TTL is 1 year — the code no
+  longer bears the "tokens die on restart" limitation.
 """
 from __future__ import annotations
 
@@ -24,9 +23,11 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
+from store import OAuthTokenStore
+
 
 CODE_TTL_SECONDS = 300  # authorization code lives 5 min
-TOKEN_TTL_SECONDS = 30 * 24 * 3600  # access token lives 30 days
+DEFAULT_TOKEN_TTL_SECONDS = 365 * 24 * 3600  # 1 year
 
 
 @dataclass
@@ -38,16 +39,12 @@ class AuthCode:
     expires_at: float
 
 
-@dataclass
-class AccessToken:
-    client_id: str
-    expires_at: float
-
-
 class OAuthStore:
-    def __init__(self) -> None:
+    """Codes in-memory, tokens delegated to a persistent OAuthTokenStore."""
+
+    def __init__(self, token_store: OAuthTokenStore) -> None:
         self._codes: dict[str, AuthCode] = {}
-        self._tokens: dict[str, AccessToken] = {}
+        self._tokens = token_store
 
     def issue_code(
         self,
@@ -74,15 +71,11 @@ class OAuthStore:
 
     def issue_token(self, client_id: str) -> str:
         token = secrets.token_urlsafe(32)
-        self._tokens[token] = AccessToken(
-            client_id=client_id,
-            expires_at=time.time() + TOKEN_TTL_SECONDS,
-        )
+        self._tokens.issue(token, client_id)
         return token
 
     def validate_token(self, token: str) -> bool:
-        entry = self._tokens.get(token)
-        return entry is not None and entry.expires_at >= time.time()
+        return self._tokens.validate(token)
 
 
 def verify_pkce(code_verifier: str, code_challenge: str, method: str) -> bool:
