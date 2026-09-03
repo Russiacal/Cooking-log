@@ -489,15 +489,41 @@ async def photos_pending(request: Request) -> JSONResponse:
     if auth != f"Bearer {SHORTCUT_BEARER_TOKEN}":
         return JSONResponse({"error": "unauthorized"}, status_code=401)
 
-    try:
-        payload = await request.json()
-    except (ValueError, json.JSONDecodeError):
-        return JSONResponse({"error": "invalid_json"}, status_code=400)
+    # Accept two body formats:
+    #  1. JSON  {"urls": ["...", "..."], "uploaded_at"?: float}
+    #  2. Form  urls=<newline-separated URLs>  (easier for iOS Shortcuts,
+    #     whose JSON-body UI won't accept a list variable in an Array field)
+    content_type = request.headers.get("content-type", "")
+    uploaded_at: Optional[float] = None
 
-    urls = payload.get("urls")
-    if not isinstance(urls, list) or not all(isinstance(u, str) for u in urls):
+    if content_type.startswith("application/x-www-form-urlencoded") or content_type.startswith(
+        "multipart/form-data"
+    ):
+        form = await request.form()
+        raw = str(form.get("urls", ""))
+        urls = [u.strip() for u in raw.splitlines() if u.strip()]
+        ts_raw = form.get("uploaded_at")
+        if ts_raw:
+            try:
+                uploaded_at = float(str(ts_raw))
+            except ValueError:
+                pass
+    else:
+        try:
+            payload = await request.json()
+        except (ValueError, json.JSONDecodeError):
+            return JSONResponse({"error": "invalid_json"}, status_code=400)
+        urls = payload.get("urls")
+        if not isinstance(urls, list) or not all(isinstance(u, str) for u in urls):
+            return JSONResponse(
+                {"error": "invalid_request", "detail": "urls must be a list of strings"},
+                status_code=400,
+            )
+        uploaded_at = payload.get("uploaded_at")
+
+    if not urls:
         return JSONResponse(
-            {"error": "invalid_request", "detail": "urls must be a list of strings"},
+            {"error": "invalid_request", "detail": "no urls provided"},
             status_code=400,
         )
 
@@ -514,7 +540,6 @@ async def photos_pending(request: Request) -> JSONResponse:
                 status_code=400,
             )
 
-    uploaded_at = payload.get("uploaded_at")
     added = photo_queue.add(urls, uploaded_at=uploaded_at)
     return JSONResponse(
         {"added": added, "total_pending": photo_queue.count_unconsumed()}
