@@ -168,18 +168,24 @@ def publish_cook(
     - `## Next time` — only if Julia explicitly gave next-time notes.
       Don't infer or promote body observations to this section.
 
-    PHOTOS:
-    - If `photos` is omitted or None, any pending photos uploaded via
-      Julia's iOS Shortcut are auto-attached and the queue is cleared.
-      This is the default happy path — she snaps photos while cooking,
-      the Shortcut queues them, publish_cook picks them up.
-    - Pass `photos=[]` explicitly to publish with NO photos even if
-      there are pending ones.
-    - Pass a specific list of URLs to override (queue is left alone
-      and NOT cleared).
-    - If no pending photos exist AND `photos` is omitted, use the
-      source recipe's photo (with `photo_credit`) so the card has a
-      thumbnail.
+    PHOTOS — every cook MUST have at least one photo. The board is
+    photo-heavy; a photo-less card looks broken. Priority order:
+
+    1. If `photos` is omitted (None), first call get_pending_photos.
+       If the queue has any, pass them in as `photos` (they'll be
+       consumed on publish).
+    2. If the queue is empty AND `source_url` is set: fetch the source
+       page and extract the hero image (og:image meta tag is the
+       reliable location). Pass that as `photos=[url]` with
+       `photo_credit=<site name>`.
+    3. Only if both above fail: ask Julia whether to publish photo-less
+       or skip. Never silently publish a cook with no photo when a
+       source recipe exists.
+
+    Explicit overrides:
+    - `photos=[]` — publish with zero photos, don't touch the queue
+      (rare; use only when Julia explicitly says "no photos").
+    - `photos=[url1, url2]` — use these exactly; queue is left alone.
 
     Args:
         title: Recipe title, e.g. "Miso-glazed salmon" (required).
@@ -305,6 +311,66 @@ def search_cooks(query: str) -> list[dict]:
             }
         )
     return results
+
+
+@mcp.tool()
+def set_cook_photos(
+    slug: str,
+    photos: list[str],
+    photo_credit: Optional[str] = None,
+) -> str:
+    """Update photos + photo_credit on an EXISTING cook. Body untouched.
+
+    Use for backfilling missing photos on old cooks. Reads the cook by
+    slug, replaces only the `photos` and `photo_credit` frontmatter
+    fields, preserves everything else (title, tags, body, dates, etc.)
+    exactly as-is.
+
+    Slug format: same as the URL slug, e.g. "2026-07-15-salade-nioise-mostly-atk".
+    Get it from list_recent_cooks or search_cooks.
+
+    Backfill workflow for cooks missing photos:
+    1. Call list_recent_cooks(50) to get all cooks + which have photos.
+    2. For each cook where `photos` is empty AND `source_url` is set:
+       a. Fetch the source page.
+       b. Extract the primary/hero image URL (usually og:image meta tag
+          or the first content image).
+       c. Call set_cook_photos(slug, [image_url], photo_credit=<site name>).
+    3. Cooks with no source_url can't be auto-backfilled — skip them.
+
+    Args:
+        slug: Existing cook's slug (must exist — errors if not found).
+        photos: List of image URLs. Pass [] to clear existing photos.
+            First URL becomes the card thumbnail.
+        photo_credit: Attribution, e.g. "NYT Cooking". Just the site
+            name is fine. Pass None to clear existing credit.
+
+    Returns:
+        The live URL of the updated cook.
+    """
+    try:
+        existing = backend.read(slug)
+    except (FileNotFoundError, Exception) as e:
+        raise ValueError(f"Cook not found: {slug}. {e}") from e
+
+    fm = parse_frontmatter(existing)
+    if fm is None:
+        raise ValueError(f"Cook {slug} has no valid frontmatter — refusing to overwrite")
+
+    end = existing.find("\n---", 3)
+    body = existing[end + 4:].lstrip("\n")
+
+    fm["photos"] = photos
+    if photo_credit is not None:
+        fm["photo_credit"] = photo_credit
+    elif "photo_credit" in fm:
+        del fm["photo_credit"]
+
+    yaml_str = yaml.safe_dump(fm, sort_keys=False, allow_unicode=True).strip()
+    content = f"---\n{yaml_str}\n---\n\n{body}"
+
+    backend.write(slug, content)
+    return f"{SITE_URL}/{slug}/"
 
 
 @mcp.tool()
